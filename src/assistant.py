@@ -1,4 +1,4 @@
-"""Optional LLM-powered placement mentor. API credentials are never written to SQLite."""
+"""Optional LLM-powered placement mentor. API credentials are never written to PostgreSQL."""
 
 def build_system_prompt(context: dict) -> str:
     """Build a grounded mentor prompt from the candidate's saved app data."""

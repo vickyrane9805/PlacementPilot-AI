@@ -1,31 +1,9 @@
-
-# Python virtual environments
+.env
 venv/
 .venv/
-env/
-
-# Environment variables and secrets
-.env
-.env.*
-!.env.example
-
-# SQLite database and backups
+__pycache__/
+*.pyc
 *.db
 *.db-wal
 *.db-shm
-*.db-journal
-*.sqlite
-*.sqlite3
-
-# Python cache
-__pycache__/
-*.py[cod]
-.pytest_cache/
-
-# IDE files
-.vscode/
-.idea/
-
-# OS files
-.DS_Store
-Thumbs.db
+.streamlit/secrets.toml

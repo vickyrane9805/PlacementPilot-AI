@@ -3,7 +3,7 @@ import os
 import re
 from dotenv import load_dotenv
 from datetime import date, datetime, timedelta
-from src.database import (DB_PATH, init_db, add_application, get_applications, update_application, delete_application,
+from src.database import (initialize_database, connect, save_workspace_state, get_workspace_state, init_db, add_application, get_applications, update_application, delete_application,
                           init_planner_db, add_planner_task, get_planner_tasks, set_planner_task_done, delete_planner_task, update_planner_task,
                           init_profile_db, save_resume, get_profile, save_target_role, get_application_stats, get_task_stats,
                           init_mentor_db, save_mentor_message, get_mentor_messages, clear_mentor_messages,
@@ -13,39 +13,54 @@ from src.engine import (analyze_match, extract_text, make_interview_questions, e
 from src.opportunities import OPPORTUNITIES
 from src.live_jobs import fetch_remote_tech_jobs
 from src.assistant import ask_mentor
-from src.blob_backup import bootstrap_database, backup_database, get_blob_token
+import hmac
+import logging
 
 load_dotenv()
 st.set_page_config(page_title="PlacementPilot AI", page_icon="🎯", layout="wide")
 
 
+# Single-user workspace: require a password before exposing personal records.
+password = os.environ.get("APP_PASSWORD", "")
+if not password:
+    st.error("Set APP_PASSWORD in Streamlit Secrets or .env before using this app.")
+    st.stop()
+if not st.session_state.get("authenticated"):
+    with st.form("workspace_login"):
+        entered = st.text_input("Workspace password", type="password")
+        submitted = st.form_submit_button("Sign in")
+    if submitted:
+        if hmac.compare_digest(entered.encode(), password.encode()):
+            st.session_state.authenticated = True
+            st.rerun()
+        st.error("Incorrect password.")
+    st.stop()
+
 @st.cache_resource
-def _restore_database_once():
-    """Restore the latest private cloud backup once per Streamlit server process."""
-    try:
-        return bootstrap_database(DB_PATH)
-    except Exception as exc:
-        # Keep the app available if Blob is temporarily unreachable. Never replace
-        # a local DB unless a remote backup has passed integrity validation.
-        return {"configured": True, "restored": False, "backup": None, "error": str(exc)}
+def _initialize_once():
+    initialize_database()
+    return True
 
+try:
+    _initialize_once()
+    with connect() as con:
+        con.execute("SELECT 1")
+    if not st.session_state.get("workspace_loaded"):
+        for key, value in get_workspace_state().items():
+            if key in {"last_match", "last_jd", "gap_roadmap", "questions", "answer_idx", "interview_description"}:
+                st.session_state[key] = value
+        st.session_state.workspace_loaded = True
+except Exception:
+    logging.exception("Cloud database unavailable")
+    st.error("Supabase is unavailable. Check DATABASE_URL, project status and network, then retry. No local database will be created.")
+    if st.button("Retry connection"):
+        st.rerun()
+    st.stop()
 
-blob_backup_status = _restore_database_once()
-init_db(); init_planner_db(); init_profile_db(); init_mentor_db(); init_roadmap_db()
+def persist_state(key, value):
+    save_workspace_state(key, value)
+    st.session_state[key] = value
 
-
-@st.cache_resource
-def _backup_initialized_database_once():
-    # Persist the initialized schema on first startup as well as user data.
-    if get_blob_token():
-        try:
-            return backup_database(DB_PATH)
-        except Exception as exc:
-            return f"backup_error: {exc}"
-    return "disabled"
-
-
-initial_backup_result = _backup_initialized_database_once()
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=Manrope:wght@600;700;800&display=swap');
 :root{--ink:#172033;--muted:#718096;--line:#e7ebf3;--violet:#6857e8;--cyan:#22b8cf}
@@ -71,15 +86,10 @@ st.markdown('<div class="hero"><div class="eyebrow">YOUR CAREER, IN CONTROL</div
 profile = get_profile()
 with st.sidebar:
     st.markdown("## ✦ Your workspace")
-    if blob_backup_status.get("configured"):
-        if blob_backup_status.get("restored"):
-            st.success("Cloud database restored from Vercel Blob")
-        elif blob_backup_status.get("error"):
-            st.warning("Cloud backup could not be checked. Your local database is still available.")
-        else:
-            st.caption("Vercel Blob backup is connected. New database changes are backed up automatically.")
-    else:
-        st.info("Cloud backups are not configured yet. Add BLOB_READ_WRITE_TOKEN in Streamlit Secrets.")
+    st.success("Supabase PostgreSQL connected")
+    if st.button("Sign out"):
+        st.session_state.clear()
+        st.rerun()
     if profile and profile[1]:
         st.success("Resume saved in the app database")
         st.caption(f"📄 {profile[0]} · saved {profile[2]}")
@@ -167,13 +177,13 @@ with pages[0]:
 
 with pages[1]:
     st.subheader("Resume vs Job Description")
-    jd = st.text_area("Paste a complete job description", height=220, placeholder="Responsibilities, required skills, qualifications...")
+    jd = st.text_area("Paste a complete job description", height=220, value=st.session_state.get("last_jd", ""), placeholder="Responsibilities, required skills, qualifications...")
     if st.button("Analyze my match", type="primary", disabled=not jd.strip()):
         resume = resume_text
         if not resume: st.warning("Upload your resume in the sidebar first.")
         else:
-            st.session_state.last_match = analyze_match(resume, jd)
-            st.session_state.last_jd = jd
+            persist_state("last_match", analyze_match(resume, jd))
+            persist_state("last_jd", jd)
     if "last_match" in st.session_state:
         r = st.session_state.last_match
         a,b,c = st.columns(3); a.metric("Resume match", f"{r['score']}%"); b.metric("Matched skills", len(r['matched'])); c.metric("Skill gaps", len(r['missing']))
@@ -187,7 +197,7 @@ with pages[1]:
         for item in r['actions']: st.write("• " + item)
         if r['missing']:
             if st.button("Create a learning roadmap for these skill gaps", type="primary"):
-                st.session_state.gap_roadmap = make_gap_roadmap(r['missing'])
+                persist_state('gap_roadmap', make_gap_roadmap(r['missing']))
                 st.success("Skill-gap roadmap created. Open Flexible Roadmap to set your pace and schedule.")
         st.caption("The score is a transparent heuristic, not an employer ATS score or a hiring prediction.")
 
@@ -403,9 +413,9 @@ with pages[4]:
 
 with pages[5]:
     st.subheader("AI mock interview")
-    interview_jd = st.text_area("Paste job description (optional)", key="interview_jd", height=130)
+    interview_jd = st.text_area("Paste job description (optional)", key="interview_jd", height=130, value=st.session_state.get("interview_description", ""))
     if st.button("Generate interview questions", type="primary"):
-        st.session_state.questions = make_interview_questions(target_role, interview_jd, resume_text); st.session_state.answer_idx = 0
+        persist_state("answer_idx", 0); persist_state("questions", make_interview_questions(target_role, interview_jd, resume_text)); persist_state("interview_description", interview_jd)
     if "questions" in st.session_state:
         qs = st.session_state.questions; idx = st.session_state.get("answer_idx",0)
         st.caption(f"Question {idx+1} of {len(qs)}"); st.markdown(f"### {qs[idx]}")
@@ -413,8 +423,8 @@ with pages[5]:
         if st.button("Evaluate answer", disabled=not answer.strip()):
             ev = evaluate_answer(answer, qs[idx], interview_jd); st.metric("Answer completeness",f"{ev['score']}%"); st.write("**What worked:**",ev['strength']); st.write("**Improve:**",ev['improve']); st.write("**Try adding:**",ev['missing'])
         p,n = st.columns(2)
-        if p.button("← Previous",disabled=idx==0): st.session_state.answer_idx=idx-1; st.rerun()
-        if n.button("Next →",disabled=idx>=len(qs)-1): st.session_state.answer_idx=idx+1; st.rerun()
+        if p.button("← Previous",disabled=idx==0): persist_state("answer_idx", idx-1); st.rerun()
+        if n.button("Next →",disabled=idx>=len(qs)-1): persist_state("answer_idx", idx+1); st.rerun()
 
 with pages[6]:
     st.subheader("Application pipeline")
@@ -459,7 +469,7 @@ with pages[7]:
         base_default = os.getenv("OPENAI_BASE_URL") or _secret("OPENAI_BASE_URL", "")
     config_col1, config_col2 = st.columns([1, 2])
     with config_col1:
-        api_key = st.text_input(f"{provider} API key", value=key_default, type="password", key=f"mentor_key_{provider}", help="Kept in this app session only. It is never saved in the SQLite database.")
+        api_key = st.text_input(f"{provider} API key", value=key_default, type="password", key=f"mentor_key_{provider}", help="Kept in this app session only. It is never saved in the Supabase database.")
     with config_col2:
         model_name = st.text_input("Model name", value=model_default, key=f"mentor_model_{provider}")
         if provider == "OpenAI":
@@ -547,7 +557,7 @@ with pages[7]:
     if history and st.button("Clear mentor conversation", type="secondary"):
         clear_mentor_messages()
         st.rerun()
-    st.caption("Privacy: recent chat messages are stored in the app's SQLite database. The API key is not stored there. Your resume and chat are transmitted to the provider only when you send a prompt with consent enabled. Use a private deployment and review your provider's data policy.")
+    st.caption("Privacy: recent chat messages are stored in the app's Supabase database. The API key is not stored there. Your resume and chat are transmitted to the provider only when you send a prompt with consent enabled. Use a private deployment and review your provider's data policy.")
 
 
 
